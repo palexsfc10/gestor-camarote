@@ -1,5 +1,9 @@
 # Pérola Demo — guia do operador (NTWS Labs)
 
+> **Preferido:** automação com um comando — ver [`DEPLOY_AUTOMATION.md`](./DEPLOY_AUTOMATION.md)
+> (`deploy-vps.sh <sha>`, Makefile `demo-*`). Este documento cobre o procedimento
+> manual, Cloudflare Access e contexto operacional.
+
 ## Escopo
 
 - Demo **frontend only** (Next.js standalone).
