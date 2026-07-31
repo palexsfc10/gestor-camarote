@@ -25,9 +25,24 @@ Tudo o que aparece na demo é **simulacro**. Não há dados reais de clientes.
 gestor-camarote/
   docs/                 # Produto, UX e protótipo
   web/                  # App Next.js (App Router)
-  deploy/demo/          # Compose/Dockerfile docs da demo (sem deploy automático)
+  deploy/demo/          # Automação VPS + compose da demo
+  Makefile              # wrappers make demo-*
   README.md
 ```
+
+## Deploy da demo (VPS — operador)
+
+Scripts idempotentes em `deploy/demo/` para o operador na VPS (Cursor **não**
+acessa a VPS). Documentação: [`deploy/demo/DEPLOY_AUTOMATION.md`](deploy/demo/DEPLOY_AUTOMATION.md).
+
+```bash
+sudo ./deploy/demo/preflight-vps.sh
+sudo ./deploy/demo/deploy-vps.sh --dry-run <sha>
+sudo ./deploy/demo/deploy-vps.sh <sha>
+```
+
+Hostname planejado: `perola-demo.ntws.cloud` · bind `127.0.0.1:3107`.
+Cloudflare Tunnel continua configuração **manual** (uma vez).
 
 ## Stack e versões (protótipo)
 
@@ -123,7 +138,7 @@ Ver [docs/prototype/00_PROTOTYPE_SCOPE.md](docs/prototype/00_PROTOTYPE_SCOPE.md)
 - Sem backend, banco, auth real ou integrações (WhatsApp, pagamento, e-mail).
 - Estado da demo vive no `sessionStorage` do navegador.
 - Isolamento por evento e fluxos Mesa/Camarote/Aniversário são de protótipo.
-- `deploy/demo/` descreve publicação controlada futura; **não** há deploy automático neste repositório.
+- Publicação VPS é **manual pelo operador** via `deploy/demo/deploy-vps.sh` (sem acesso remoto do Cursor).
 - Materiais brutos locais do venue não entram no Git; assets da demo estão em `web/public/perola/`.
 
 ## Princípios-chave

@@ -1,0 +1,854 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+# Shared helpers for Pérola demo VPS automation (NTWS Labs).
+# No secrets, no IPs, no credentials. Safe for a public repository.
+
+set -Eeuo pipefail
+
+# ---------------------------------------------------------------------------
+# Constants (fixed VPS layout)
+# ---------------------------------------------------------------------------
+readonly DEMO_ROOT="/srv/docker/perola-demo"
+readonly REPO_DIR="${DEMO_ROOT}/repo"
+readonly LOG_DIR="${DEMO_ROOT}/logs"
+readonly RELEASES_DIR="${DEMO_ROOT}/releases"
+readonly BACKUPS_DIR="${DEMO_ROOT}/backups"
+readonly CURRENT_SHA_FILE="${DEMO_ROOT}/CURRENT_SHA"
+readonly PREVIOUS_SHA_FILE="${DEMO_ROOT}/PREVIOUS_SHA"
+readonly LAST_DEPLOY_REPORT="${DEMO_ROOT}/LAST_DEPLOY_REPORT.txt"
+readonly DEMO_MARKER_FILE="${DEMO_ROOT}/.perola-demo-marker"
+readonly LOCK_FILE="${LOG_DIR}/perola-demo.lock"
+readonly EXPECTED_HOSTNAME="${PEROLA_DEMO_EXPECTED_HOSTNAME:-srv1793294}"
+readonly GITHUB_REPO_URL="https://github.com/palexsfc10/gestor-camarote.git"
+readonly GITHUB_REPO_HTTPS="https://github.com/palexsfc10/gestor-camarote"
+readonly COMPOSE_REL="deploy/demo/compose.demo.yaml"
+readonly SERVICE_NAME="perola-demo-web"
+readonly CONTAINER_NAME="perola-demo-web"
+readonly NETWORK_NAME="perola-demo-net"
+readonly BIND_HOST="127.0.0.1"
+readonly BIND_PORT="3107"
+readonly CONTAINER_PORT="3000"
+readonly INTERNAL_BASE="http://${BIND_HOST}:${BIND_PORT}"
+readonly HEALTH_TIMEOUT_SEC="${PEROLA_DEMO_HEALTH_TIMEOUT:-120}"
+readonly SMOKE_MAX_SECONDS="${PEROLA_DEMO_SMOKE_MAX_SECONDS:-5}"
+readonly MIN_DISK_MB="${PEROLA_DEMO_MIN_DISK_MB:-2048}"
+readonly MIN_MEM_MB="${PEROLA_DEMO_MIN_MEM_MB:-512}"
+readonly PROTECTED_NAME_REGEX='(kyvora|arena|croniu|postgres|cloudflared|cloudflare)'
+
+# Resolved at source time
+COMMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPTS_DIR="$(cd "${COMMON_DIR}/.." && pwd)"
+# When scripts live inside a checkout: .../repo/deploy/demo
+LOCAL_REPO_ROOT="$(cd "${SCRIPTS_DIR}/../.." && pwd)"
+
+DRY_RUN=0
+ASSUME_YES=0
+EXTERNAL_URL=""
+DEPLOY_TS=""
+ACTIVE_LOG=""
+LOCK_FD=9
+PREVIOUS_CONTAINER_IDS_FILE=""
+DOCKER_OK=0
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+_ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+
+log()  { printf '[%s] INFO  %s\n' "$(_ts)" "$*"; }
+warn() { printf '[%s] WARN  %s\n' "$(_ts)" "$*" >&2; }
+err()  { printf '[%s] ERROR %s\n' "$(_ts)" "$*" >&2; }
+die()  { err "$*"; exit 1; }
+
+log_both() {
+  local msg="$*"
+  log "$msg"
+  if [[ -n "${ACTIVE_LOG:-}" ]]; then
+    printf '[%s] INFO  %s\n' "$(_ts)" "$msg" >>"$ACTIVE_LOG"
+  fi
+}
+
+require_cmd() {
+  local c
+  for c in "$@"; do
+    command -v "$c" >/dev/null 2>&1 || die "Required command not found: $c"
+  done
+}
+
+is_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]]; }
+
+confirm() {
+  local prompt="${1:-Continue?}"
+  if [[ "$ASSUME_YES" -eq 1 ]]; then
+    log "Confirmation skipped (--yes): ${prompt}"
+    return 0
+  fi
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "DRY-RUN: would prompt: ${prompt}"
+    return 0
+  fi
+  local answer=""
+  printf '%s [y/N] ' "$prompt" >&2
+  read -r answer || true
+  [[ "$answer" == "y" || "$answer" == "Y" || "$answer" == "yes" ]] || die "Aborted by operator."
+}
+
+init_deploy_timestamp() {
+  DEPLOY_TS="$(date -u +"%Y%m%dT%H%M%SZ")"
+}
+
+ensure_demo_dirs() {
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "DRY-RUN: would ensure dirs under ${DEMO_ROOT}"
+    return 0
+  fi
+  mkdir -p "$LOG_DIR" "$RELEASES_DIR" "$BACKUPS_DIR"
+}
+
+start_log() {
+  local prefix="$1"
+  ensure_demo_dirs
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    ACTIVE_LOG="/dev/null"
+    log "DRY-RUN: log sink disabled (prefix=${prefix})"
+    return 0
+  fi
+  ACTIVE_LOG="${LOG_DIR}/${prefix}-${DEPLOY_TS}.log"
+  : >"$ACTIVE_LOG"
+  log "Log file: ${ACTIVE_LOG}"
+}
+
+on_error() {
+  local ec=$?
+  local line="${1:-?}"
+  err "Aborted (exit=${ec}) at line ${line}"
+  if [[ -n "${ACTIVE_LOG:-}" && "$ACTIVE_LOG" != "/dev/null" ]]; then
+    printf '[%s] ERROR Aborted (exit=%s) at line %s\n' "$(_ts)" "$ec" "$line" >>"$ACTIVE_LOG" || true
+  fi
+  exit "$ec"
+}
+
+install_error_trap() {
+  trap 'on_error $LINENO' ERR
+}
+
+# ---------------------------------------------------------------------------
+# Lock (flock)
+# ---------------------------------------------------------------------------
+acquire_lock() {
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "DRY-RUN: would acquire lock ${LOCK_FILE}"
+    return 0
+  fi
+  ensure_demo_dirs
+  eval "exec ${LOCK_FD}>\"${LOCK_FILE}\""
+  if ! flock -n "$LOCK_FD"; then
+    die "Another Pérola demo operation holds ${LOCK_FILE}. Wait or inspect the lock."
+  fi
+  log "Lock acquired: ${LOCK_FILE}"
+}
+
+release_lock() {
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    return 0
+  fi
+  flock -u "$LOCK_FD" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# Demo root ownership / marker
+# ---------------------------------------------------------------------------
+write_demo_marker() {
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "DRY-RUN: would write marker ${DEMO_MARKER_FILE}"
+    return 0
+  fi
+  cat >"$DEMO_MARKER_FILE" <<EOF
+project=gestor-camarote
+demo=perola-demo
+owner=ntws-labs
+created_utc=$(_ts)
+EOF
+}
+
+assert_demo_root_safe() {
+  if [[ ! -e "$DEMO_ROOT" ]]; then
+    log "Demo root does not exist yet: ${DEMO_ROOT}"
+    return 0
+  fi
+  if [[ ! -d "$DEMO_ROOT" ]]; then
+    die "Path exists but is not a directory: ${DEMO_ROOT}"
+  fi
+  if [[ -f "$DEMO_MARKER_FILE" ]]; then
+    if ! grep -q 'demo=perola-demo' "$DEMO_MARKER_FILE" 2>/dev/null; then
+      die "Marker present but not for perola-demo. Refusing to touch ${DEMO_ROOT}"
+    fi
+    log "Demo marker OK: ${DEMO_MARKER_FILE}"
+    return 0
+  fi
+  # Existing dir without marker: only allow known layout
+  local unknown=0
+  local entry
+  shopt -s nullglob
+  for entry in "${DEMO_ROOT}"/* "${DEMO_ROOT}"/.[!.]*; do
+    [[ -e "$entry" ]] || continue
+    local base
+    base="$(basename "$entry")"
+    case "$base" in
+      repo|logs|releases|backups|CURRENT_SHA|PREVIOUS_SHA|LAST_DEPLOY_REPORT.txt|.perola-demo-marker)
+        ;;
+      *)
+        warn "Unexpected entry in demo root: ${base}"
+        unknown=1
+        ;;
+    esac
+  done
+  shopt -u nullglob
+  if [[ "$unknown" -eq 1 ]]; then
+    die "Refusing to use ${DEMO_ROOT}: unknown contents without .perola-demo-marker"
+  fi
+  log "Demo root looks like perola-demo layout (no foreign trees)."
+}
+
+# ---------------------------------------------------------------------------
+# Argument helpers
+# ---------------------------------------------------------------------------
+normalize_sha() {
+  local sha="${1:-}"
+  sha="${sha,,}"
+  [[ -n "$sha" ]] || die "SHA argument is required (refusing implicit HEAD)."
+  [[ "$sha" =~ ^[0-9a-f]{7,40}$ ]] || die "Invalid SHA format: ${sha}"
+  printf '%s' "$sha"
+}
+
+parse_common_flags() {
+  # Mutates global DRY_RUN / ASSUME_YES / EXTERNAL_URL; leaves remaining in ARGS array
+  ARGS=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run) DRY_RUN=1; shift ;;
+      --yes|-y) ASSUME_YES=1; shift ;;
+      --external)
+        [[ $# -ge 2 ]] || die "--external requires a URL"
+        EXTERNAL_URL="${2%/}"
+        shift 2
+        ;;
+      --help|-h)
+        return 2
+        ;;
+      --)
+        shift
+        ARGS+=("$@")
+        break
+        ;;
+      -*)
+        die "Unknown flag: $1"
+        ;;
+      *)
+        ARGS+=("$1")
+        shift
+        ;;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Host / resource checks
+# ---------------------------------------------------------------------------
+check_hostname() {
+  local host
+  host="$(hostname -s 2>/dev/null || hostname)"
+  if [[ "$host" != "$EXPECTED_HOSTNAME" ]]; then
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      warn "Hostname is '${host}', expected '${EXPECTED_HOSTNAME}' (allowed in --dry-run)."
+      return 0
+    fi
+    die "Unexpected hostname '${host}' (expected '${EXPECTED_HOSTNAME}'). Set PEROLA_DEMO_EXPECTED_HOSTNAME to override."
+  fi
+  log "Hostname OK: ${host}"
+}
+
+check_privileges() {
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    if is_root; then
+      log "Running as root (dry-run)."
+    else
+      warn "Not root — dry-run continues; real deploy requires sudo/root."
+    fi
+    return 0
+  fi
+  is_root || die "Run with sudo/root (needed for ${DEMO_ROOT} and Docker)."
+  log "Privileges OK (root)."
+}
+
+check_arch() {
+  local arch
+  arch="$(uname -m)"
+  log "Architecture: ${arch}"
+  case "$arch" in
+    x86_64|amd64|aarch64|arm64) ;;
+    *) warn "Unusual architecture: ${arch}" ;;
+  esac
+}
+
+check_disk() {
+  local avail=""
+  local target="/"
+  if [[ -d "$DEMO_ROOT" ]]; then
+    target="$DEMO_ROOT"
+  elif [[ "$DRY_RUN" -eq 1 ]]; then
+    target="."
+  fi
+  avail="$(df -Pm "$target" 2>/dev/null | awk 'NR==2{print $4}' || true)"
+  if [[ -z "$avail" || ! "$avail" =~ ^[0-9]+$ ]]; then
+    avail="$(df -Pm . 2>/dev/null | awk 'NR==2{print $4}' || true)"
+  fi
+  log "Free disk (MB) on ${target}: ${avail:-unknown}"
+  if [[ "$avail" =~ ^[0-9]+$ ]]; then
+    if (( avail < MIN_DISK_MB )); then
+      die "Insufficient disk: ${avail}MB < ${MIN_DISK_MB}MB"
+    fi
+  elif [[ "$DRY_RUN" -eq 1 ]]; then
+    warn "Could not determine free disk (dry-run continues)."
+  else
+    die "Could not determine free disk"
+  fi
+}
+
+check_memory() {
+  local mem_mb=0
+  if [[ -r /proc/meminfo ]]; then
+    mem_mb="$(awk '/MemAvailable:/{printf "%d", $2/1024}' /proc/meminfo)"
+  fi
+  log "Available memory (MB): ${mem_mb}"
+  if [[ "${mem_mb}" -gt 0 && "${mem_mb}" -lt "$MIN_MEM_MB" ]]; then
+    die "Insufficient memory: ${mem_mb}MB < ${MIN_MEM_MB}MB"
+  fi
+}
+
+check_docker() {
+  DOCKER_OK=0
+  if [[ "$DRY_RUN" -eq 1 && "${PEROLA_DEMO_DRY_RUN_DOCKER:-0}" != "1" ]]; then
+    warn "DRY-RUN: skipping Docker engine probe (set PEROLA_DEMO_DRY_RUN_DOCKER=1 to enable)."
+    return 0
+  fi
+  if ! command -v docker >/dev/null 2>&1; then
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      warn "docker CLI not found — dry-run continues with static checks only."
+      return 0
+    fi
+    die "Required command not found: docker"
+  fi
+  if ! docker info >/dev/null 2>&1; then
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      warn "Docker daemon not accessible — dry-run continues without live compose/engine checks."
+      return 0
+    fi
+    die "Docker daemon is not running or not accessible."
+  fi
+  if docker compose version >/dev/null 2>&1; then
+    log "Docker Compose: $(docker compose version --short 2>/dev/null || docker compose version | head -1)"
+  else
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      warn "Docker Compose plugin missing — dry-run continues."
+      return 0
+    fi
+    die "Docker Compose plugin not available (need: docker compose)."
+  fi
+  DOCKER_OK=1
+}
+
+check_git() {
+  require_cmd git
+  log "Git: $(git --version)"
+}
+
+check_github_access() {
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "DRY-RUN: skipping live GitHub HTTP probe (use git fetch on VPS)."
+    return 0
+  fi
+  if command -v curl >/dev/null 2>&1; then
+    if curl -fsSIL --connect-timeout 5 --max-time 10 "${GITHUB_REPO_HTTPS}" >/dev/null 2>&1; then
+      log "GitHub HTTP reachability OK"
+      return 0
+    fi
+    warn "GitHub HTTP check failed (network/DNS). git fetch may still work."
+    return 0
+  fi
+  warn "curl missing; skipped GitHub HTTP check."
+}
+
+check_port_3107() {
+  local listeners=""
+  if command -v ss >/dev/null 2>&1; then
+    listeners="$(ss -ltnp 2>/dev/null | grep -E ':3107\b' || true)"
+  elif command -v lsof >/dev/null 2>&1; then
+    listeners="$(lsof -nP -iTCP:3107 -sTCP:LISTEN 2>/dev/null || true)"
+  fi
+  if [[ -z "$listeners" ]]; then
+    log "Port ${BIND_PORT} appears free (or could not be probed)."
+    return 0
+  fi
+  if echo "$listeners" | grep -qi "$CONTAINER_NAME"; then
+    log "Port ${BIND_PORT} held by ${CONTAINER_NAME} (expected for redeploy)."
+    return 0
+  fi
+  if [[ "$DOCKER_OK" -eq 1 ]] && docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$CONTAINER_NAME"; then
+    log "Port ${BIND_PORT} in use and ${CONTAINER_NAME} is running (OK)."
+    return 0
+  fi
+  err "Port ${BIND_PORT} is occupied by a foreign process:"
+  err "$listeners"
+  die "Refusing to continue while ${BIND_PORT} is taken by something other than ${CONTAINER_NAME}."
+}
+
+compose_file_path() {
+  if [[ -f "${REPO_DIR}/${COMPOSE_REL}" ]]; then
+    printf '%s' "${REPO_DIR}/${COMPOSE_REL}"
+    return 0
+  fi
+  if [[ -f "${SCRIPTS_DIR}/compose.demo.yaml" ]]; then
+    printf '%s' "${SCRIPTS_DIR}/compose.demo.yaml"
+    return 0
+  fi
+  die "compose.demo.yaml not found (repo checkout missing?)."
+}
+
+compose_cmd() {
+  local file
+  file="$(compose_file_path)"
+  # shellcheck disable=SC2086
+  docker compose -f "$file" --project-name perola-demo "$@"
+}
+
+# ---------------------------------------------------------------------------
+# Compose security validation
+# ---------------------------------------------------------------------------
+validate_compose_file() {
+  local file="$1"
+  [[ -f "$file" ]] || die "Compose file missing: $file"
+  log "Validating compose: $file"
+
+  if [[ "$DOCKER_OK" -ne 1 ]]; then
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      warn "DRY-RUN: docker unavailable — static compose text checks only"
+      validate_compose_static "$file"
+      return 0
+    fi
+    die "Docker required to render compose config"
+  fi
+
+  local rendered
+  if ! rendered="$(docker compose -f "$file" --project-name perola-demo config 2>&1)"; then
+    err "$rendered"
+    die "docker compose config failed"
+  fi
+
+  local tmp
+  tmp="$(mktemp)"
+  printf '%s\n' "$rendered" >"$tmp"
+
+  # Only one app service expected
+  local services
+  services="$(docker compose -f "$file" --project-name perola-demo config --services 2>/dev/null || true)"
+  if [[ -z "$services" ]]; then
+    die "Could not list compose services"
+  fi
+  if ! printf '%s\n' "$services" | grep -qx "$SERVICE_NAME"; then
+    die "Compose must define service ${SERVICE_NAME}"
+  fi
+  local other
+  other="$(printf '%s\n' "$services" | grep -vx "$SERVICE_NAME" || true)"
+  if [[ -n "$other" ]]; then
+    die "Compose defines unexpected services: ${other}"
+  fi
+
+  grep -Eq "published: \"?${BIND_PORT}\"?|${BIND_HOST}:${BIND_PORT}:${CONTAINER_PORT}|\"${BIND_HOST}:${BIND_PORT}:${CONTAINER_PORT}\"" "$tmp" \
+    || grep -Eq "${BIND_HOST}.*${BIND_PORT}|${BIND_PORT}" "$tmp" \
+    || die "Bind ${BIND_HOST}:${BIND_PORT}:${CONTAINER_PORT} not found in rendered compose"
+
+  # Prefer explicit published/host_ip checks when present
+  if grep -q 'published:' "$tmp"; then
+    grep -q "published: \"${BIND_PORT}\"" "$tmp" || grep -q "published: ${BIND_PORT}" "$tmp" \
+      || die "Published port must be ${BIND_PORT}"
+    if grep -q 'host_ip:' "$tmp"; then
+      grep -q "host_ip: ${BIND_HOST}" "$tmp" || die "host_ip must be ${BIND_HOST}"
+    fi
+  fi
+
+  grep -Eq "name: ${NETWORK_NAME}|${NETWORK_NAME}" "$tmp" || die "Network ${NETWORK_NAME} missing"
+
+  validate_compose_forbidden "$tmp"
+  rm -f "$tmp"
+  log "Compose validation OK (isolated ${SERVICE_NAME} only)."
+}
+
+validate_compose_static() {
+  local file="$1"
+  grep -q "container_name: ${CONTAINER_NAME}" "$file" || die "static: missing container_name ${CONTAINER_NAME}"
+  grep -q "${BIND_HOST}:${BIND_PORT}:${CONTAINER_PORT}" "$file" || die "static: missing bind ${BIND_HOST}:${BIND_PORT}:${CONTAINER_PORT}"
+  grep -q "${NETWORK_NAME}" "$file" || die "static: missing network ${NETWORK_NAME}"
+  grep -q "perola-demo-web:" "$file" || die "static: missing service ${SERVICE_NAME}"
+  validate_compose_forbidden "$file"
+  log "Static compose checks OK: $file"
+}
+
+validate_compose_forbidden() {
+  local tmp="$1"
+  local bad
+  for bad in \
+    'privileged: true' \
+    'network_mode: host' \
+    'network_mode: "host"' \
+    '/var/run/docker.sock' \
+    'docker.sock'
+  do
+    if grep -Fiq -- "$bad" "$tmp"; then
+      die "Forbidden compose setting detected: ${bad}"
+    fi
+  done
+  # DB / infra image or service hints
+  if grep -Ei 'image:.*(postgres|mysql|mariadb|mongo|redis)' "$tmp" >/dev/null; then
+    die "Forbidden database/infra image reference in compose"
+  fi
+  if awk '/^networks:/{n=1} n&&/external:[[:space:]]*true/{print; exit 0} END{exit 1}' "$tmp"; then
+    die "External Docker networks are forbidden for this demo"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Git / SHA
+# ---------------------------------------------------------------------------
+ensure_repo() {
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    if [[ -d "${LOCAL_REPO_ROOT}/.git" ]]; then
+      log "DRY-RUN: using local checkout ${LOCAL_REPO_ROOT}"
+      return 0
+    fi
+    log "DRY-RUN: would clone ${GITHUB_REPO_URL} → ${REPO_DIR}"
+    return 0
+  fi
+
+  assert_demo_root_safe
+  ensure_demo_dirs
+  write_demo_marker
+
+  if [[ ! -d "${REPO_DIR}/.git" ]]; then
+    if [[ -e "$REPO_DIR" ]]; then
+      die "${REPO_DIR} exists but is not a git repository. Refusing to overwrite."
+    fi
+    log "Cloning repository into ${REPO_DIR}"
+    git clone "$GITHUB_REPO_URL" "$REPO_DIR"
+  else
+    log "Repository already present: ${REPO_DIR}"
+  fi
+
+  (
+    cd "$REPO_DIR"
+    local origin
+    origin="$(git remote get-url origin 2>/dev/null || true)"
+    if [[ -z "$origin" ]]; then
+      die "origin remote missing in ${REPO_DIR}"
+    fi
+    case "$origin" in
+      *palexsfc10/gestor-camarote*) log "origin OK: ${origin}" ;;
+      *) die "Unexpected origin remote: ${origin}" ;;
+    esac
+
+    if [[ -n "$(git status --porcelain)" ]]; then
+      die "Working tree has local changes in ${REPO_DIR}. Clean or document before deploy."
+    fi
+
+    log "Fetching from origin (no pull)"
+    git fetch --tags --prune origin
+  )
+}
+
+repo_workdir() {
+  if [[ "$DRY_RUN" -eq 1 && -d "${LOCAL_REPO_ROOT}/.git" ]]; then
+    printf '%s' "$LOCAL_REPO_ROOT"
+  else
+    printf '%s' "$REPO_DIR"
+  fi
+}
+
+verify_remote_sha() {
+  local sha="$1"
+  local wd
+  wd="$(repo_workdir)"
+  (
+    cd "$wd"
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      git fetch --tags --prune origin 2>/dev/null || true
+    fi
+    if ! git cat-file -e "${sha}^{commit}" 2>/dev/null; then
+      # try after fetch
+      git fetch --tags --prune origin 2>/dev/null || true
+    fi
+    git cat-file -e "${sha}^{commit}" 2>/dev/null || die "SHA not found in repository: ${sha}"
+    local full
+    full="$(git rev-parse "${sha}^{commit}")"
+    printf '%s' "$full"
+  )
+}
+
+checkout_sha() {
+  local full_sha="$1"
+  local wd
+  wd="$(repo_workdir)"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "DRY-RUN: would checkout detached ${full_sha} in ${wd}"
+    (
+      cd "$wd"
+      git rev-parse "${full_sha}^{commit}" >/dev/null
+    )
+    return 0
+  fi
+  (
+    cd "$wd"
+    if [[ -n "$(git status --porcelain)" ]]; then
+      die "Refusing checkout: dirty working tree"
+    fi
+    log "Checkout detached HEAD at ${full_sha}"
+    git checkout --detach "$full_sha"
+    local now
+    now="$(git rev-parse HEAD)"
+    [[ "$now" == "$full_sha" ]] || die "HEAD mismatch after checkout: ${now} != ${full_sha}"
+    log "Confirmed HEAD=${now}"
+  )
+}
+
+read_sha_file() {
+  local f="$1"
+  if [[ -f "$f" ]]; then
+    tr -d '[:space:]' <"$f"
+  fi
+}
+
+write_sha_files() {
+  local new_sha="$1"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "DRY-RUN: would set CURRENT_SHA=${new_sha}"
+    return 0
+  fi
+  local prev
+  prev="$(read_sha_file "$CURRENT_SHA_FILE" || true)"
+  if [[ -n "$prev" && "$prev" != "$new_sha" ]]; then
+    printf '%s\n' "$prev" >"$PREVIOUS_SHA_FILE"
+    log "PREVIOUS_SHA ← ${prev}"
+  fi
+  printf '%s\n' "$new_sha" >"$CURRENT_SHA_FILE"
+  mkdir -p "${RELEASES_DIR}/${new_sha}"
+  cat >"${RELEASES_DIR}/${new_sha}/meta.txt" <<EOF
+sha=${new_sha}
+deployed_utc=$(_ts)
+image=perola-demo-web:local
+container=${CONTAINER_NAME}
+EOF
+  log "CURRENT_SHA ← ${new_sha}"
+}
+
+# ---------------------------------------------------------------------------
+# Container inventory / protection
+# ---------------------------------------------------------------------------
+snapshot_containers() {
+  local out="$1"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "DRY-RUN: would snapshot containers → ${out}"
+    return 0
+  fi
+  {
+    echo "# containers snapshot $(_ts)"
+    docker ps -a --format 'table {{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}'
+    echo
+    echo "# started_at"
+    docker ps -a --format '{{.Names}} {{.ID}}' | while read -r name id; do
+      [[ -n "$id" ]] || continue
+      local started
+      started="$(docker inspect -f '{{.State.StartedAt}}' "$id" 2>/dev/null || echo unknown)"
+      echo "${name} ${id} ${started}"
+    done
+  } >"$out"
+  log "Container snapshot: $out"
+}
+
+assert_protected_not_restarted() {
+  local before="$1"
+  local after="$2"
+  [[ -f "$before" && -f "$after" ]] || return 0
+  local line name id started_before started_after
+  while read -r name id started_before; do
+    [[ "$name" == \#* || -z "$name" ]] && continue
+    if echo "$name" | grep -Eiq "$PROTECTED_NAME_REGEX"; then
+      started_after="$(awk -v n="$name" '$1==n{print $3; exit}' "$after" || true)"
+      if [[ -n "$started_after" && -n "$started_before" && "$started_after" != "$started_before" ]]; then
+        die "Protected container restarted unexpectedly: ${name} (${started_before} → ${started_after})"
+      fi
+    fi
+  done < <(awk '/^# started_at/{f=1;next} f && NF>=3{print}' "$before")
+  log "Protected containers were not restarted."
+}
+
+diagnose_cloudflared() {
+  if [[ "$DOCKER_OK" -ne 1 ]]; then
+    warn "Skipping cloudflared diagnostic (Docker unavailable)."
+    return 0
+  fi
+  if docker ps --format '{{.Names}} {{.Status}}' 2>/dev/null | grep -Ei 'cloudflared|cloudflare' || true; then
+    log "Cloudflare Tunnel containers (diagnostic only — not modified):"
+    docker ps --format '{{.Names}}\t{{.Status}}' | grep -Ei 'cloudflared|cloudflare' || true
+  else
+    warn "No cloudflared/cloudflare container name matched (diagnostic only)."
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Health / failure diagnostics
+# ---------------------------------------------------------------------------
+wait_healthy() {
+  local deadline=$((SECONDS + HEALTH_TIMEOUT_SEC))
+  local status=""
+  log "Waiting for health (timeout ${HEALTH_TIMEOUT_SEC}s)..."
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "DRY-RUN: skip health wait"
+    return 0
+  fi
+  while (( SECONDS < deadline )); do
+    if ! docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
+      status="missing"
+    else
+      status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$CONTAINER_NAME" 2>/dev/null || echo unknown)"
+    fi
+    case "$status" in
+      healthy)
+        log "Container healthy."
+        return 0
+        ;;
+      unhealthy|exited|dead)
+        err "Container status: ${status}"
+        return 1
+        ;;
+      restarting)
+        warn "Container restarting..."
+        ;;
+      starting|running|created|"")
+        ;;
+      *)
+        warn "Health status: ${status}"
+        ;;
+    esac
+    sleep 3
+  done
+  err "Healthcheck timeout after ${HEALTH_TIMEOUT_SEC}s (last=${status})"
+  return 1
+}
+
+collect_failure_diagnostics() {
+  local out="${1:-}"
+  if [[ -z "$out" ]]; then
+    ensure_demo_dirs
+    out="${LOG_DIR}/failure-${DEPLOY_TS:-$(_ts)}.log"
+  fi
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "DRY-RUN: would collect failure diagnostics → ${out}"
+    return 0
+  fi
+  {
+    echo "=== failure diagnostics $(_ts) ==="
+    echo "--- compose ps ---"
+    compose_cmd ps || true
+    echo "--- inspect ---"
+    docker inspect "$CONTAINER_NAME" 2>&1 || true
+    echo "--- logs (200) ---"
+    docker logs --tail 200 "$CONTAINER_NAME" 2>&1 || true
+    echo "--- memory ---"
+    docker stats --no-stream "$CONTAINER_NAME" 2>&1 || true
+    echo "--- port ---"
+    ss -ltnp 2>/dev/null | grep 3107 || true
+    curl -sI --max-time 5 "${INTERNAL_BASE}/demo" 2>&1 || true
+  } >"$out"
+  err "Diagnostics saved: ${out}"
+}
+
+# ---------------------------------------------------------------------------
+# Build / up (no down, no prune)
+# ---------------------------------------------------------------------------
+record_previous_image() {
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    return 0
+  fi
+  if docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
+    docker inspect -f 'image={{.Image}} image_id={{.Image}} status={{.State.Status}}' "$CONTAINER_NAME" \
+      | tee -a "${ACTIVE_LOG:-/dev/null}" >/dev/null || true
+  fi
+}
+
+build_demo() {
+  local file
+  file="$(compose_file_path)"
+  validate_compose_file "$file"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "DRY-RUN: would build ${SERVICE_NAME} via ${file}"
+    return 0
+  fi
+  log "Building ${SERVICE_NAME}..."
+  local start=$SECONDS
+  compose_cmd build "$SERVICE_NAME"
+  log "Build duration: $((SECONDS - start))s"
+}
+
+up_demo() {
+  local file
+  file="$(compose_file_path)"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "DRY-RUN: would up -d ${SERVICE_NAME} via ${file}"
+    return 0
+  fi
+  log "Starting ${SERVICE_NAME} (no compose down)..."
+  compose_cmd up -d "$SERVICE_NAME"
+}
+
+stop_demo_only() {
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "DRY-RUN: would stop/remove only ${CONTAINER_NAME}"
+    return 0
+  fi
+  if docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
+    log "Stopping ${CONTAINER_NAME} only"
+    docker stop "$CONTAINER_NAME" >/dev/null || true
+    docker rm "$CONTAINER_NAME" >/dev/null || true
+  else
+    log "Container ${CONTAINER_NAME} not present"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Reporting
+# ---------------------------------------------------------------------------
+write_deploy_report() {
+  local verdict="$1"
+  shift
+  local body="$*"
+  local report_file
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "DRY-RUN verdict: ${verdict}"
+    printf '%s\n' "$body"
+    return 0
+  fi
+  report_file="${LOG_DIR}/deploy-${DEPLOY_TS}.log"
+  {
+    echo "=== Pérola Demo Deploy Report ==="
+    echo "verdict=${verdict}"
+    echo "hostname=$(hostname)"
+    echo "date_utc=$(_ts)"
+    echo "$body"
+  } | tee "$report_file" | tee "$LAST_DEPLOY_REPORT" >/dev/null
+  # Also append to ACTIVE_LOG if distinct
+  if [[ -n "${ACTIVE_LOG:-}" && "$ACTIVE_LOG" != "$report_file" ]]; then
+    cat "$report_file" >>"$ACTIVE_LOG" || true
+  fi
+  log "Report: ${report_file}"
+  log "LAST_DEPLOY_REPORT.txt updated"
+  log "VERDICT: ${verdict}"
+}
