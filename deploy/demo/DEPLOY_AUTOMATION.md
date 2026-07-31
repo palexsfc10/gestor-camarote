@@ -57,18 +57,22 @@ Todos usam `set -Eeuo pipefail`, `flock`, timestamps, códigos de saída e
 
 ## Fluxo do deploy
 
-1. Lock + preflight (hostname, root, Docker, disco, memória, porta 3107).
-2. Snapshot de containers (`containers-before-*.txt`).
-3. Clone ou `git fetch` (sem `pull`); remote deve ser `gestor-camarote`.
-4. Valida o SHA no remoto; **checkout detached** exatamente nesse commit.
-5. `docker compose config` + regras de isolamento (só `perola-demo-web`,
+1. **Pré-escrita (sem tocar em `/srv/docker/perola-demo`):** privilégios →
+   hostname → inspeção read-only do caminho → lock em `/run/lock/perola-demo-deploy.lock`
+   (fallback `/var/lock` ou `/tmp`).
+2. **Fase mutável:** criar dirs + marker + log (somente após as validações).
+3. Snapshot de containers (`containers-before-*.txt`).
+4. Clone ou `git fetch` (sem `pull`); remote deve ser `gestor-camarote`.
+5. Valida o SHA no remoto; **checkout detached** exatamente nesse commit.
+6. `docker compose config` + regras de isolamento (só `perola-demo-web`,
    bind `127.0.0.1:3107:3000`, rede `perola-demo-net`, sem DB/privileged/host
    network/socket Docker/redes externas).
-6. `build` + `up -d` **somente** `perola-demo-web` (sem `compose down`, sem prune).
-7. Aguarda health até ~120s; em falha coleta diagnóstico e rollback automático.
-8. Smokes internos.
-9. Grava `CURRENT_SHA`, relatório `logs/deploy-<ts>.log` e `LAST_DEPLOY_REPORT.txt`.
-10. Confirma que stacks protegidos não reiniciaram.
+7. `build` (falha aqui **não** faz rollback — versão atual preservada).
+8. A partir de `up -d`: janela de mutação (`DEPLOY_MUTATION_STARTED=1`);
+   health + smokes; falha → rollback automático (sem recursão).
+9. Inventário posterior + comparação de **todos** os containers preexistentes
+   (exceto `perola-demo-web`).
+10. Só então grava `CURRENT_SHA` / `PREVIOUS_SHA` (escrita atômica) e relatório.
 
 SHA é **obrigatório**. Não se implanta `HEAD` de `main` implicitamente.
 
@@ -182,10 +186,29 @@ Porta `3107` ocupada por processo que **não** seja `perola-demo-web` → aborta
 
 | Código | Significado |
 | --- | --- |
-| `DEPLOY_SUCCESS` | Health + smokes OK |
+| `DEPLOY_SUCCESS` | Health + smokes + inventário OK; SHA commitado |
 | `DEPLOY_SUCCESS_WITH_WARNINGS` | Sucesso com avisos (reservado) |
-| `DEPLOY_FAILED_ROLLED_BACK` | Falha; versão anterior restaurada |
-| `DEPLOY_FAILED_NO_PREVIOUS_RELEASE` | Falha; sem release anterior (demo parada) |
+| `DEPLOY_FAILED_ROLLED_BACK` | Falha; versão anterior restaurada e com smoke OK |
+| `DEPLOY_FAILED_ROLLBACK_SMOKE` | Rollback healthy mas smoke falhou; demo parada; SHA não commitado |
+| `DEPLOY_FAILED_ROLLBACK_FAILED` | Rollback falhou (health/recursão); demo parada |
+| `DEPLOY_FAILED_NO_PREVIOUS_RELEASE` | Falha sem release anterior (ou antes de `up -d`) |
+
+Testes de segurança locais:
+
+```bash
+bash deploy/demo/tests/run-security-tests.sh
+# ou: make demo-security-tests
+
+# ShellCheck via container (sem instalar na VPS):
+docker run --rm -v "$PWD:/src" -w /src koalaman/shellcheck:stable \
+  -x deploy/demo/lib/common.sh \
+  deploy/demo/preflight-vps.sh \
+  deploy/demo/deploy-vps.sh \
+  deploy/demo/smoke-vps.sh \
+  deploy/demo/rollback-vps.sh \
+  deploy/demo/status-vps.sh \
+  deploy/demo/tests/run-security-tests.sh
+```
 
 ---
 

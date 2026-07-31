@@ -17,7 +17,6 @@ readonly CURRENT_SHA_FILE="${DEMO_ROOT}/CURRENT_SHA"
 readonly PREVIOUS_SHA_FILE="${DEMO_ROOT}/PREVIOUS_SHA"
 readonly LAST_DEPLOY_REPORT="${DEMO_ROOT}/LAST_DEPLOY_REPORT.txt"
 readonly DEMO_MARKER_FILE="${DEMO_ROOT}/.perola-demo-marker"
-readonly LOCK_FILE="${LOG_DIR}/perola-demo.lock"
 readonly EXPECTED_HOSTNAME="${PEROLA_DEMO_EXPECTED_HOSTNAME:-srv1793294}"
 readonly GITHUB_REPO_URL="https://github.com/palexsfc10/gestor-camarote.git"
 readonly GITHUB_REPO_HTTPS="https://github.com/palexsfc10/gestor-camarote"
@@ -30,6 +29,8 @@ readonly BIND_PORT="3107"
 readonly CONTAINER_PORT="3000"
 readonly INTERNAL_BASE="http://${BIND_HOST}:${BIND_PORT}"
 readonly HEALTH_TIMEOUT_SEC="${PEROLA_DEMO_HEALTH_TIMEOUT:-120}"
+# Used by smoke-vps.sh after sourcing this library
+# shellcheck disable=SC2034
 readonly SMOKE_MAX_SECONDS="${PEROLA_DEMO_SMOKE_MAX_SECONDS:-5}"
 readonly MIN_DISK_MB="${PEROLA_DEMO_MIN_DISK_MB:-2048}"
 readonly MIN_MEM_MB="${PEROLA_DEMO_MIN_MEM_MB:-512}"
@@ -43,12 +44,21 @@ LOCAL_REPO_ROOT="$(cd "${SCRIPTS_DIR}/../.." && pwd)"
 
 DRY_RUN=0
 ASSUME_YES=0
+# shellcheck disable=SC2034
 EXTERNAL_URL=""
 DEPLOY_TS=""
 ACTIVE_LOG=""
 LOCK_FD=9
-PREVIOUS_CONTAINER_IDS_FILE=""
 DOCKER_OK=0
+# Transactional deploy state (mutated by deploy-vps.sh / rollback-vps.sh)
+# shellcheck disable=SC2034
+DEPLOY_MUTATION_STARTED=0
+# shellcheck disable=SC2034
+ROLLBACK_IN_PROGRESS=0
+# shellcheck disable=SC2034
+DEPLOY_COMMITTED=0
+# shellcheck disable=SC2034
+ROLLBACK_TARGET_SHA=""
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -102,20 +112,41 @@ ensure_demo_dirs() {
     log "DRY-RUN: would ensure dirs under ${DEMO_ROOT}"
     return 0
   fi
-  mkdir -p "$LOG_DIR" "$RELEASES_DIR" "$BACKUPS_DIR"
+  mkdir -p "$DEMO_ROOT" "$LOG_DIR" "$RELEASES_DIR" "$BACKUPS_DIR"
+}
+
+# Call ONLY after privileges + hostname + assert_demo_root_safe.
+begin_mutable_phase() {
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    ACTIVE_LOG="/dev/null"
+    log "DRY-RUN: mutable phase skipped — no writes under ${DEMO_ROOT}"
+    return 0
+  fi
+  ensure_demo_dirs
+  write_demo_marker
 }
 
 start_log() {
   local prefix="$1"
-  ensure_demo_dirs
   if [[ "$DRY_RUN" -eq 1 ]]; then
     ACTIVE_LOG="/dev/null"
     log "DRY-RUN: log sink disabled (prefix=${prefix})"
     return 0
   fi
+  if [[ ! -d "$LOG_DIR" ]]; then
+    die "Refusing start_log: ${LOG_DIR} missing (call begin_mutable_phase after validations)."
+  fi
   ACTIVE_LOG="${LOG_DIR}/${prefix}-${DEPLOY_TS}.log"
   : >"$ACTIVE_LOG"
   log "Log file: ${ACTIVE_LOG}"
+}
+
+# Read-only gate sequence shared by all operator scripts.
+# Does not create DEMO_ROOT, logs, markers, or locks under /srv/docker/perola-demo.
+run_pre_write_validations() {
+  check_privileges
+  check_hostname
+  assert_demo_root_safe
 }
 
 on_error() {
@@ -133,19 +164,40 @@ install_error_trap() {
 }
 
 # ---------------------------------------------------------------------------
-# Lock (flock)
+# Lock (flock) — system path, independent of DEMO_ROOT
 # ---------------------------------------------------------------------------
-acquire_lock() {
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    log "DRY-RUN: would acquire lock ${LOCK_FILE}"
+resolve_lock_file() {
+  local candidate="${PEROLA_DEMO_LOCK_FILE:-}"
+  if [[ -n "$candidate" ]]; then
+    printf '%s' "$candidate"
     return 0
   fi
-  ensure_demo_dirs
-  eval "exec ${LOCK_FD}>\"${LOCK_FILE}\""
-  if ! flock -n "$LOCK_FD"; then
-    die "Another Pérola demo operation holds ${LOCK_FILE}. Wait or inspect the lock."
+  if [[ -d /run/lock && -w /run/lock ]]; then
+    printf '%s' "/run/lock/perola-demo-deploy.lock"
+    return 0
   fi
-  log "Lock acquired: ${LOCK_FILE}"
+  if [[ -d /var/lock && -w /var/lock ]]; then
+    printf '%s' "/var/lock/perola-demo-deploy.lock"
+    return 0
+  fi
+  # Last resort (lab/dry-run hosts) — still outside DEMO_ROOT
+  printf '%s' "/tmp/perola-demo-deploy.lock"
+}
+
+acquire_lock() {
+  local lock
+  lock="$(resolve_lock_file)"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "DRY-RUN: would acquire lock ${lock}"
+    return 0
+  fi
+  # Ensure parent of lock exists when using /run/lock (root) — never DEMO_ROOT
+  mkdir -p "$(dirname "$lock")" 2>/dev/null || true
+  eval "exec ${LOCK_FD}>\"${lock}\""
+  if ! flock -n "$LOCK_FD"; then
+    die "Another Pérola demo operation holds ${lock}. Wait or inspect the lock."
+  fi
+  log "Lock acquired: ${lock}"
 }
 
 release_lock() {
@@ -230,6 +282,8 @@ parse_common_flags() {
       --yes|-y) ASSUME_YES=1; shift ;;
       --external)
         [[ $# -ge 2 ]] || die "--external requires a URL"
+        # Consumed by smoke-vps.sh / status-vps.sh after sourcing this library
+        # shellcheck disable=SC2034
         EXTERNAL_URL="${2%/}"
         shift 2
         ;;
@@ -512,9 +566,21 @@ validate_compose_forbidden() {
   if grep -Ei 'image:.*(postgres|mysql|mariadb|mongo|redis)' "$tmp" >/dev/null; then
     die "Forbidden database/infra image reference in compose"
   fi
-  if awk '/^networks:/{n=1} n&&/external:[[:space:]]*true/{print; exit 0} END{exit 1}' "$tmp"; then
+  if compose_file_has_external_network "$tmp"; then
     die "External Docker networks are forbidden for this demo"
   fi
+}
+
+# Deterministic: exit 0 if an external network is declared, else exit 1.
+# Uses `found` so END cannot overwrite a match with a blind exit 1.
+compose_file_has_external_network() {
+  awk '
+    BEGIN { found = 0; in_networks = 0 }
+    /^[[:space:]]*networks:[[:space:]]*$/ { in_networks = 1; next }
+    in_networks && /^[^[:space:]#]/ { in_networks = 0 }
+    in_networks && /external:[[:space:]]*true([[:space:]]|$)/ { found = 1 }
+    END { if (found) exit 0; exit 1 }
+  ' "$1"
 }
 
 # ---------------------------------------------------------------------------
@@ -530,9 +596,10 @@ ensure_repo() {
     return 0
   fi
 
-  assert_demo_root_safe
-  ensure_demo_dirs
-  write_demo_marker
+  # DEMO_ROOT must already have passed assert_demo_root_safe + begin_mutable_phase
+  if [[ ! -d "$DEMO_ROOT" ]]; then
+    die "Refusing ensure_repo: ${DEMO_ROOT} missing (mutable phase not started)."
+  fi
 
   if [[ ! -d "${REPO_DIR}/.git" ]]; then
     if [[ -e "$REPO_DIR" ]]; then
@@ -626,27 +693,42 @@ read_sha_file() {
   fi
 }
 
+atomic_write_file() {
+  local dest="$1"
+  local content="$2"
+  local dir tmp
+  dir="$(dirname "$dest")"
+  mkdir -p "$dir"
+  tmp="$(mktemp "${dir}/.tmp.XXXXXX")"
+  printf '%s\n' "$content" >"$tmp"
+  mv -f "$tmp" "$dest"
+}
+
+# Call ONLY after healthy + smokes + inventory comparison + all gates.
 write_sha_files() {
   local new_sha="$1"
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    log "DRY-RUN: would set CURRENT_SHA=${new_sha}"
+    log "DRY-RUN: would set CURRENT_SHA=${new_sha} (atomic, post-gates)"
     return 0
   fi
   local prev
   prev="$(read_sha_file "$CURRENT_SHA_FILE" || true)"
   if [[ -n "$prev" && "$prev" != "$new_sha" ]]; then
-    printf '%s\n' "$prev" >"$PREVIOUS_SHA_FILE"
+    atomic_write_file "$PREVIOUS_SHA_FILE" "$prev"
     log "PREVIOUS_SHA ← ${prev}"
   fi
-  printf '%s\n' "$new_sha" >"$CURRENT_SHA_FILE"
+  atomic_write_file "$CURRENT_SHA_FILE" "$new_sha"
   mkdir -p "${RELEASES_DIR}/${new_sha}"
-  cat >"${RELEASES_DIR}/${new_sha}/meta.txt" <<EOF
+  local meta
+  meta="$(mktemp "${RELEASES_DIR}/${new_sha}/.meta.XXXXXX")"
+  cat >"$meta" <<EOF
 sha=${new_sha}
 deployed_utc=$(_ts)
 image=perola-demo-web:local
 container=${CONTAINER_NAME}
 EOF
-  log "CURRENT_SHA ← ${new_sha}"
+  mv -f "$meta" "${RELEASES_DIR}/${new_sha}/meta.txt"
+  log "CURRENT_SHA ← ${new_sha} (committed after all gates)"
 }
 
 # ---------------------------------------------------------------------------
@@ -657,6 +739,9 @@ snapshot_containers() {
   if [[ "$DRY_RUN" -eq 1 ]]; then
     log "DRY-RUN: would snapshot containers → ${out}"
     return 0
+  fi
+  if [[ "$DOCKER_OK" -ne 1 ]]; then
+    die "Docker required for container snapshot"
   fi
   {
     echo "# containers snapshot $(_ts)"
@@ -673,21 +758,59 @@ snapshot_containers() {
   log "Container snapshot: $out"
 }
 
-assert_protected_not_restarted() {
+assert_preexisting_containers_unchanged() {
   local before="$1"
   local after="$2"
-  [[ -f "$before" && -f "$after" ]] || return 0
-  local line name id started_before started_after
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "DRY-RUN: would compare all pre-existing containers (except ${CONTAINER_NAME})"
+    return 0
+  fi
+  if [[ ! -f "$before" || ! -f "$after" ]]; then
+    err "Missing container inventory for comparison (${before} / ${after})"
+    return 1
+  fi
+
+  local name id started_before after_id after_started
+  local notable=()
+
   while read -r name id started_before; do
-    [[ "$name" == \#* || -z "$name" ]] && continue
+    [[ -z "$name" || "$name" == \#* ]] && continue
+    # Only perola-demo-web may change during this deploy
+    if [[ "$name" == "$CONTAINER_NAME" ]]; then
+      continue
+    fi
+
+    after_id="$(awk -v n="$name" '$1==n{print $2; exit}' "$after" || true)"
+    after_started="$(awk -v n="$name" '$1==n{print $3; exit}' "$after" || true)"
+
+    if [[ -z "$after_id" ]]; then
+      err "Pre-existing container missing after deploy: ${name}"
+      return 1
+    fi
+    if [[ "$after_id" != "$id" ]]; then
+      err "Pre-existing container ID changed: ${name} (${id} → ${after_id})"
+      return 1
+    fi
+    if [[ "$after_started" != "$started_before" ]]; then
+      err "Pre-existing container restarted: ${name} (${started_before} → ${after_started})"
+      return 1
+    fi
+
     if echo "$name" | grep -Eiq "$PROTECTED_NAME_REGEX"; then
-      started_after="$(awk -v n="$name" '$1==n{print $3; exit}' "$after" || true)"
-      if [[ -n "$started_after" && -n "$started_before" && "$started_after" != "$started_before" ]]; then
-        die "Protected container restarted unexpectedly: ${name} (${started_before} → ${started_after})"
-      fi
+      notable+=("$name")
     fi
   done < <(awk '/^# started_at/{f=1;next} f && NF>=3{print}' "$before")
-  log "Protected containers were not restarted."
+
+  log "All pre-existing containers unchanged (except ${CONTAINER_NAME})."
+  if [[ ${#notable[@]} -gt 0 ]]; then
+    log "Notable stacks verified unchanged: ${notable[*]}"
+  fi
+  return 0
+}
+
+# Backward-compatible alias
+assert_protected_not_restarted() {
+  assert_preexisting_containers_unchanged "$@"
 }
 
 diagnose_cloudflared() {
@@ -747,23 +870,31 @@ wait_healthy() {
 collect_failure_diagnostics() {
   local out="${1:-}"
   if [[ -z "$out" ]]; then
-    ensure_demo_dirs
-    out="${LOG_DIR}/failure-${DEPLOY_TS:-$(_ts)}.log"
+    if [[ -d "$LOG_DIR" ]]; then
+      out="${LOG_DIR}/failure-${DEPLOY_TS:-$(_ts)}.log"
+    else
+      out="/tmp/perola-demo-failure-${DEPLOY_TS:-$(_ts)}.log"
+    fi
   fi
   if [[ "$DRY_RUN" -eq 1 ]]; then
     log "DRY-RUN: would collect failure diagnostics → ${out}"
     return 0
   fi
+  mkdir -p "$(dirname "$out")" 2>/dev/null || true
   {
     echo "=== failure diagnostics $(_ts) ==="
     echo "--- compose ps ---"
-    compose_cmd ps || true
-    echo "--- inspect ---"
-    docker inspect "$CONTAINER_NAME" 2>&1 || true
-    echo "--- logs (200) ---"
-    docker logs --tail 200 "$CONTAINER_NAME" 2>&1 || true
-    echo "--- memory ---"
-    docker stats --no-stream "$CONTAINER_NAME" 2>&1 || true
+    if [[ "$DOCKER_OK" -eq 1 ]]; then
+      compose_cmd ps || true
+      echo "--- inspect ---"
+      docker inspect "$CONTAINER_NAME" 2>&1 || true
+      echo "--- logs (200) ---"
+      docker logs --tail 200 "$CONTAINER_NAME" 2>&1 || true
+      echo "--- memory ---"
+      docker stats --no-stream "$CONTAINER_NAME" 2>&1 || true
+    else
+      echo "(docker unavailable)"
+    fi
     echo "--- port ---"
     ss -ltnp 2>/dev/null | grep 3107 || true
     curl -sI --max-time 5 "${INTERNAL_BASE}/demo" 2>&1 || true
@@ -775,7 +906,7 @@ collect_failure_diagnostics() {
 # Build / up (no down, no prune)
 # ---------------------------------------------------------------------------
 record_previous_image() {
-  if [[ "$DRY_RUN" -eq 1 ]]; then
+  if [[ "$DRY_RUN" -eq 1 || "$DOCKER_OK" -ne 1 ]]; then
     return 0
   fi
   if docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
@@ -794,8 +925,12 @@ build_demo() {
   fi
   log "Building ${SERVICE_NAME}..."
   local start=$SECONDS
-  compose_cmd build "$SERVICE_NAME"
+  if ! compose_cmd build "$SERVICE_NAME"; then
+    err "Build failed for ${SERVICE_NAME}"
+    return 1
+  fi
   log "Build duration: $((SECONDS - start))s"
+  return 0
 }
 
 up_demo() {
@@ -806,12 +941,20 @@ up_demo() {
     return 0
   fi
   log "Starting ${SERVICE_NAME} (no compose down)..."
-  compose_cmd up -d "$SERVICE_NAME"
+  if ! compose_cmd up -d "$SERVICE_NAME"; then
+    err "up -d failed for ${SERVICE_NAME}"
+    return 1
+  fi
+  return 0
 }
 
 stop_demo_only() {
   if [[ "$DRY_RUN" -eq 1 ]]; then
     log "DRY-RUN: would stop/remove only ${CONTAINER_NAME}"
+    return 0
+  fi
+  if [[ "$DOCKER_OK" -ne 1 ]]; then
+    warn "Cannot stop ${CONTAINER_NAME}: Docker unavailable"
     return 0
   fi
   if docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then

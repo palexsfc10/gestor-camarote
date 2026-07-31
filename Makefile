@@ -12,7 +12,7 @@
 
 SHELL := /bin/bash
 .ONESHELL:
-.PHONY: demo-preflight demo-deploy demo-smoke demo-status demo-rollback demo-dry-run help
+.PHONY: demo-preflight demo-deploy demo-smoke demo-status demo-rollback demo-dry-run demo-security-tests help
 
 DEMO_DIR := deploy/demo
 SCRIPTS := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/$(DEMO_DIR))
@@ -58,3 +58,6 @@ endif
 
 demo-rollback:
 	sudo "$(SCRIPTS)/rollback-vps.sh"
+
+demo-security-tests:
+	bash "$(SCRIPTS)/tests/run-security-tests.sh"

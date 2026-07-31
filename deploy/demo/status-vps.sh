@@ -4,12 +4,14 @@
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=lib/common.sh
+# shellcheck source=lib/common.sh disable=SC1091
 source "${SCRIPT_DIR}/lib/common.sh"
 
 usage() {
   cat <<'EOF'
 Usage: sudo ./deploy/demo/status-vps.sh [--external https://perola-demo.ntws.cloud] [--dry-run]
+
+Read-only status. Does not create DEMO_ROOT or mutate containers.
 EOF
 }
 
@@ -20,6 +22,13 @@ main() {
   fi
 
   install_error_trap
+  # Status is read-only: never mkdir DEMO_ROOT
+  check_privileges
+  check_hostname
+  if [[ -e "$DEMO_ROOT" ]]; then
+    assert_demo_root_safe
+  fi
+  check_docker
 
   local current previous
   current="$(read_sha_file "$CURRENT_SHA_FILE" || true)"
@@ -37,7 +46,7 @@ main() {
     echo "last_report:  (none)"
   fi
 
-  if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$CONTAINER_NAME"; then
+  if [[ "$DOCKER_OK" -eq 1 ]] && docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$CONTAINER_NAME"; then
     echo "container:    present"
     docker ps -a --filter "name=^${CONTAINER_NAME}$" --format 'status:      {{.Status}}'
     docker inspect -f 'health:      {{if .State.Health}}{{.State.Health.Status}}{{else}}n/a{{end}}
@@ -45,7 +54,7 @@ started:     {{.State.StartedAt}}
 image:       {{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null || true
     docker stats --no-stream --format 'memory:      {{.MemUsage}} ({{.MemPerc}})' "$CONTAINER_NAME" 2>/dev/null || true
   else
-    echo "container:    absent"
+    echo "container:    absent_or_docker_unavailable"
   fi
 
   echo "port_bind:    ${BIND_HOST}:${BIND_PORT}"
@@ -64,7 +73,11 @@ image:       {{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null || true
   fi
 
   echo "--- last logs (40) ---"
-  docker logs --tail 40 "$CONTAINER_NAME" 2>&1 || echo "(no logs)"
+  if [[ "$DOCKER_OK" -eq 1 ]]; then
+    docker logs --tail 40 "$CONTAINER_NAME" 2>&1 || echo "(no logs)"
+  else
+    echo "(docker unavailable)"
+  fi
   exit 0
 }
 
