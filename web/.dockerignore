@@ -1,0 +1,25 @@
+# Dependências e artefatos locais — não entram na imagem da demo
+node_modules
+.next
+.git
+.gitignore
+*.md
+!public/**
+e2e
+test-results
+playwright-report
+playwright.config.ts
+vitest.config.ts
+coverage
+.env
+.env.*
+!.env.example
+Dockerfile
+.dockerignore
+deploy
+.DS_Store
+*.log
+npm-debug.log*
+.turbo
+.vscode
+.idea

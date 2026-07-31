@@ -1,0 +1,54 @@
+# Variante para layout VPS:
+#   /srv/docker/perola-demo/compose.demo.yaml
+#   /srv/docker/perola-demo/web/
+#
+# Mesmos parâmetros de isolamento. Diff vs monorepo: build.context = ./web
+
+name: perola-demo
+
+services:
+  perola-demo-web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    image: perola-demo-web:local
+    container_name: perola-demo-web
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3107:3000"
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      HOSTNAME: "0.0.0.0"
+      NEXT_TELEMETRY_DISABLED: "1"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m
+    cpus: 0.50
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3000/demo').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 25s
+    networks:
+      - perola-demo-net
+
+networks:
+  perola-demo-net:
+    name: perola-demo-net
+    driver: bridge
