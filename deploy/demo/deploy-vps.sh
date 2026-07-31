@@ -27,104 +27,6 @@ Example:
 EOF
 }
 
-# Restores last known-good SHA (captured at deploy start).
-# Covers the mutation window starting at `docker compose up -d`.
-# Never recurses. Never marks a smoke-failed restore as CURRENT_SHA.
-run_auto_rollback() {
-  local reason="$1"
-
-  if [[ "$ROLLBACK_IN_PROGRESS" -eq 1 ]]; then
-    err "Rollback already in progress — refusing recursion (${reason})"
-    stop_demo_only
-    write_deploy_report "DEPLOY_FAILED_ROLLBACK_FAILED" "$(cat <<EOF
-reason=${reason}
-note=Recursive rollback blocked; demo container stopped.
-EOF
-)"
-    return 1
-  fi
-
-  if [[ "$DEPLOY_MUTATION_STARTED" -eq 0 ]]; then
-    err "Deploy failed before container mutation (${reason}) — preserving current version; no rollback."
-    write_deploy_report "DEPLOY_FAILED_NO_PREVIOUS_RELEASE" "$(cat <<EOF
-reason=${reason}
-note=Failure occurred before up -d; running container (if any) left untouched.
-EOF
-)"
-    return 1
-  fi
-
-  if [[ "$DEPLOY_COMMITTED" -eq 1 ]]; then
-    err "Deploy already committed — refusing auto-rollback (${reason})"
-    return 1
-  fi
-
-  ROLLBACK_IN_PROGRESS=1
-  local target="${ROLLBACK_TARGET_SHA:-}"
-  err "Deploy failed (${reason}); attempting automatic rollback of demo only..."
-
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    log "DRY-RUN: would restore last known-good SHA: ${target:-none}"
-    return 0
-  fi
-
-  if [[ -z "$target" ]]; then
-    stop_demo_only
-    write_deploy_report "DEPLOY_FAILED_NO_PREVIOUS_RELEASE" "$(cat <<EOF
-reason=${reason}
-note=No previous successful SHA; demo container stopped. Repo/logs preserved.
-EOF
-)"
-    return 1
-  fi
-
-  log_both "Auto-rollback target (last known good): ${target}"
-  collect_failure_diagnostics
-
-  ensure_repo
-  local full
-  full="$(verify_remote_sha "$target")"
-  checkout_sha "$full"
-  validate_compose_file "$(compose_file_path)"
-  build_demo
-  up_demo
-
-  if ! wait_healthy; then
-    collect_failure_diagnostics
-    stop_demo_only
-    write_deploy_report "DEPLOY_FAILED_ROLLBACK_FAILED" "$(cat <<EOF
-reason=${reason}
-note=Auto-rollback health failed; demo stopped. CURRENT_SHA unchanged.
-target=${full}
-EOF
-)"
-    return 1
-  fi
-
-  if ! "${SCRIPT_DIR}/smoke-vps.sh"; then
-    collect_failure_diagnostics
-    stop_demo_only
-    write_deploy_report "DEPLOY_FAILED_ROLLBACK_SMOKE" "$(cat <<EOF
-reason=${reason}
-note=Restored release was healthy but smoke failed; container stopped. CURRENT_SHA not updated.
-target=${full}
-EOF
-)"
-    return 1
-  fi
-
-  # Restored release passed gates — keep CURRENT_SHA as the known-good target
-  # (failed candidate was never written). Atomic refresh for clarity.
-  atomic_write_file "$CURRENT_SHA_FILE" "$full"
-  write_deploy_report "DEPLOY_FAILED_ROLLED_BACK" "$(cat <<EOF
-reason=${reason}
-restored_sha=${full}
-note=Automatic rollback restored last known-good release. Failed SHA was not recorded as CURRENT.
-EOF
-)"
-  return 1
-}
-
 main() {
   if ! parse_common_flags "$@"; then
     usage
@@ -138,12 +40,18 @@ main() {
   local requested full_sha
   requested="$(normalize_sha "${ARGS[0]}")"
 
-  install_error_trap
+  # Transactional ERR trap (state-aware). Replaces generic on_error for deploy.
+  install_transactional_error_trap
   init_deploy_timestamp
 
   DEPLOY_MUTATION_STARTED=0
   ROLLBACK_IN_PROGRESS=0
   DEPLOY_COMMITTED=0
+  ROLLBACK_CALL_COUNT=0
+  IN_ERROR_HANDLER=0
+  LAST_TRANSACTION_VERDICT=""
+  # State is read by ERR trap / run_auto_rollback in common.sh
+  log_both "tx_state mutation=${DEPLOY_MUTATION_STARTED} rollback=${ROLLBACK_IN_PROGRESS} committed=${DEPLOY_COMMITTED} attempts=${ROLLBACK_CALL_COUNT} handler=${IN_ERROR_HANDLER}"
 
   # --- No writes under DEMO_ROOT before these gates ---
   run_pre_write_validations
@@ -216,6 +124,7 @@ main() {
   # --- Mutation window opens at up -d ---
   local up_start=$SECONDS
   DEPLOY_MUTATION_STARTED=1
+  log_both "mutation_window_open=1"
   if ! up_demo; then
     collect_failure_diagnostics
     run_auto_rollback "up_failed"
@@ -243,7 +152,12 @@ main() {
   if [[ "$DRY_RUN" -eq 1 ]]; then
     log_both "DRY-RUN: would snapshot ${after} and compare inventories"
   else
-    snapshot_containers "$after"
+    # Protected by transactional ERR trap if unexpected failure; also explicit:
+    if ! snapshot_containers "$after"; then
+      collect_failure_diagnostics
+      run_auto_rollback "snapshot_after_failed"
+      exit 1
+    fi
     if ! assert_preexisting_containers_unchanged "$before" "$after"; then
       collect_failure_diagnostics
       run_auto_rollback "container_impact_failed"
@@ -251,9 +165,15 @@ main() {
     fi
   fi
 
-  # --- Commit SHA only after ALL gates ---
-  write_sha_files "$full_sha"
+  # --- Persist SHA only after ALL gates; COMMITTED only after success ---
+  if ! write_sha_files "$full_sha"; then
+    collect_failure_diagnostics
+    err "SHA persistence failed after healthy deploy — rolling back to known-good"
+    run_auto_rollback "sha_persist_failed"
+    exit 1
+  fi
   DEPLOY_COMMITTED=1
+  log_both "deploy_committed=1 sha=${full_sha}"
 
   local image_id=""
   local verdict="DEPLOY_SUCCESS"
@@ -263,7 +183,8 @@ main() {
 
   local total=$((SECONDS - deploy_start))
 
-  write_deploy_report "$verdict" "$(cat <<EOF
+  # Post-commit documentary step — failures must NOT auto-rollback
+  if ! write_deploy_report "$verdict" "$(cat <<EOF
 sha=${full_sha}
 image=${image_id:-perola-demo-web:local}
 container=${CONTAINER_NAME}
@@ -280,7 +201,12 @@ preexisting_containers=unchanged
 compose=${compose}
 cloudflare=unchanged_by_this_script
 EOF
-)"
+)"; then
+    err "Deploy report write failed after commit — demo left running at committed SHA ${full_sha}"
+    LAST_TRANSACTION_VERDICT="DEPLOY_FAILED_POST_COMMIT"
+    log_both "post_commit_failure verdict=${LAST_TRANSACTION_VERDICT}"
+    exit 1
+  fi
 
   log_both "DEPLOY_OK ${full_sha} (${total}s)"
   if [[ "$DRY_RUN" -eq 1 ]]; then

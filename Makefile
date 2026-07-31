@@ -61,3 +61,4 @@ demo-rollback:
 
 demo-security-tests:
 	bash "$(SCRIPTS)/tests/run-security-tests.sh"
+	bash "$(SCRIPTS)/tests/run-transactional-tests.sh"

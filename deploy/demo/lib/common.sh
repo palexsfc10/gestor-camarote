@@ -6,17 +6,19 @@
 set -Eeuo pipefail
 
 # ---------------------------------------------------------------------------
-# Constants (fixed VPS layout)
+# Constants (fixed VPS layout; PEROLA_DEMO_ROOT overrides for tests only)
 # ---------------------------------------------------------------------------
-readonly DEMO_ROOT="/srv/docker/perola-demo"
-readonly REPO_DIR="${DEMO_ROOT}/repo"
-readonly LOG_DIR="${DEMO_ROOT}/logs"
-readonly RELEASES_DIR="${DEMO_ROOT}/releases"
-readonly BACKUPS_DIR="${DEMO_ROOT}/backups"
-readonly CURRENT_SHA_FILE="${DEMO_ROOT}/CURRENT_SHA"
-readonly PREVIOUS_SHA_FILE="${DEMO_ROOT}/PREVIOUS_SHA"
-readonly LAST_DEPLOY_REPORT="${DEMO_ROOT}/LAST_DEPLOY_REPORT.txt"
-readonly DEMO_MARKER_FILE="${DEMO_ROOT}/.perola-demo-marker"
+DEMO_ROOT="${PEROLA_DEMO_ROOT:-/srv/docker/perola-demo}"
+REPO_DIR="${DEMO_ROOT}/repo"
+LOG_DIR="${DEMO_ROOT}/logs"
+RELEASES_DIR="${DEMO_ROOT}/releases"
+BACKUPS_DIR="${DEMO_ROOT}/backups"
+CURRENT_SHA_FILE="${DEMO_ROOT}/CURRENT_SHA"
+PREVIOUS_SHA_FILE="${DEMO_ROOT}/PREVIOUS_SHA"
+LAST_DEPLOY_REPORT="${DEMO_ROOT}/LAST_DEPLOY_REPORT.txt"
+DEMO_MARKER_FILE="${DEMO_ROOT}/.perola-demo-marker"
+readonly DEMO_ROOT REPO_DIR LOG_DIR RELEASES_DIR BACKUPS_DIR
+readonly CURRENT_SHA_FILE PREVIOUS_SHA_FILE LAST_DEPLOY_REPORT DEMO_MARKER_FILE
 readonly EXPECTED_HOSTNAME="${PEROLA_DEMO_EXPECTED_HOSTNAME:-srv1793294}"
 readonly GITHUB_REPO_URL="https://github.com/palexsfc10/gestor-camarote.git"
 readonly GITHUB_REPO_HTTPS="https://github.com/palexsfc10/gestor-camarote"
@@ -59,6 +61,15 @@ ROLLBACK_IN_PROGRESS=0
 DEPLOY_COMMITTED=0
 # shellcheck disable=SC2034
 ROLLBACK_TARGET_SHA=""
+# shellcheck disable=SC2034
+IN_ERROR_HANDLER=0
+# shellcheck disable=SC2034
+ROLLBACK_CALL_COUNT=0
+# shellcheck disable=SC2034
+LAST_TRANSACTION_VERDICT=""
+# Optional hook for tests (command string / function name)
+# shellcheck disable=SC2034
+TRANSACTIONAL_ROLLBACK_HOOK=""
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -161,6 +172,267 @@ on_error() {
 
 install_error_trap() {
   trap 'on_error $LINENO' ERR
+}
+
+# ---------------------------------------------------------------------------
+# Transactional ERR handling (deploy mutation window)
+# ---------------------------------------------------------------------------
+# Avoids silent exits after up -d. Disables ERR while handling to prevent recursion.
+transactional_finish() {
+  local code="${1:-1}"
+  if [[ "${TRANSACTIONAL_TEST_MODE:-0}" -eq 1 ]]; then
+    return "$code"
+  fi
+  exit "$code"
+}
+
+handle_transactional_error() {
+  local ec=$?
+  local line="${1:-?}"
+
+  if [[ "${IN_ERROR_HANDLER:-0}" -eq 1 ]]; then
+    err "Nested error during transactional handling at line ${line} (exit=${ec})"
+    trap - ERR
+    set +e
+    stop_demo_only >/dev/null 2>&1 || true
+    transactional_finish "${ec:-1}"
+    return $?
+  fi
+
+  IN_ERROR_HANDLER=1
+  trap - ERR
+  set +e
+
+  err "Transactional abort (exit=${ec}) at line ${line}"
+  if [[ -n "${ACTIVE_LOG:-}" && "$ACTIVE_LOG" != "/dev/null" ]]; then
+    printf '[%s] ERROR Transactional abort (exit=%s) at line %s\n' "$(_ts)" "$ec" "$line" >>"$ACTIVE_LOG" || true
+  fi
+
+  # C) Already restoring — never recurse
+  if [[ "${ROLLBACK_IN_PROGRESS:-0}" -eq 1 ]]; then
+    collect_failure_diagnostics || true
+    stop_demo_only || true
+    LAST_TRANSACTION_VERDICT="DEPLOY_FAILED_ROLLBACK_FAILED"
+    write_deploy_report "DEPLOY_FAILED_ROLLBACK_FAILED" "$(cat <<EOF
+reason=error_during_rollback
+line=${line}
+exit_code=${ec}
+note=Nested failure while ROLLBACK_IN_PROGRESS=1; perola-demo-web stopped; CURRENT_SHA unchanged.
+EOF
+)" || true
+    transactional_finish 1
+    return $?
+  fi
+
+  # D) After successful commit — documentary / post-commit only
+  if [[ "${DEPLOY_COMMITTED:-0}" -eq 1 ]]; then
+    LAST_TRANSACTION_VERDICT="DEPLOY_FAILED_POST_COMMIT"
+    write_deploy_report "DEPLOY_FAILED_POST_COMMIT" "$(cat <<EOF
+reason=post_commit_error
+line=${line}
+exit_code=${ec}
+note=Failure after DEPLOY_COMMITTED=1; automatic rollback skipped; running demo left as committed.
+EOF
+)" || true
+    transactional_finish 1
+    return $?
+  fi
+
+  # B) Mutation window — diagnose + single auto-rollback
+  if [[ "${DEPLOY_MUTATION_STARTED:-0}" -eq 1 ]]; then
+    collect_failure_diagnostics || true
+    if [[ -n "${TRANSACTIONAL_ROLLBACK_HOOK:-}" ]]; then
+      "$TRANSACTIONAL_ROLLBACK_HOOK" "unexpected_error_line_${line}" || true
+    else
+      run_auto_rollback "unexpected_error_line_${line}" || true
+    fi
+    transactional_finish 1
+    return $?
+  fi
+
+  # A) Before mutation — preserve current container
+  LAST_TRANSACTION_VERDICT="DEPLOY_FAILED_BEFORE_MUTATION"
+  write_deploy_report "DEPLOY_FAILED_BEFORE_MUTATION" "$(cat <<EOF
+reason=pre_mutation_error
+line=${line}
+exit_code=${ec}
+note=Failure before up -d; current container preserved; no rollback.
+EOF
+)" || true
+  transactional_finish 1
+  return $?
+}
+
+install_transactional_error_trap() {
+  IN_ERROR_HANDLER=0
+  trap 'handle_transactional_error $LINENO' ERR
+}
+
+# Used by restore steps that fail inside run_auto_rollback
+fail_restore_step() {
+  local step="$1"
+  local reason="$2"
+  err "Rollback restore step failed: ${step}"
+  collect_failure_diagnostics || true
+  stop_demo_only || true
+  LAST_TRANSACTION_VERDICT="DEPLOY_FAILED_ROLLBACK_FAILED"
+  write_deploy_report "DEPLOY_FAILED_ROLLBACK_FAILED" "$(cat <<EOF
+reason=${reason}
+failed_step=${step}
+note=Restore aborted; perola-demo-web stopped; CURRENT_SHA not updated with failed candidate.
+EOF
+)"
+  return 1
+}
+
+# Restores last known-good SHA. Safe against internal step failures and ERR recursion.
+# shellcheck disable=SC2120
+run_auto_rollback() {
+  local reason="${1:-unspecified}"
+
+  if [[ "${ROLLBACK_IN_PROGRESS:-0}" -eq 1 ]]; then
+    err "Rollback already in progress — refusing recursion (${reason})"
+    collect_failure_diagnostics || true
+    stop_demo_only || true
+    LAST_TRANSACTION_VERDICT="DEPLOY_FAILED_ROLLBACK_FAILED"
+    write_deploy_report "DEPLOY_FAILED_ROLLBACK_FAILED" "$(cat <<EOF
+reason=${reason}
+note=Recursive rollback blocked; demo container stopped; CURRENT_SHA unchanged.
+EOF
+)"
+    return 1
+  fi
+
+  if [[ "${DEPLOY_MUTATION_STARTED:-0}" -eq 0 ]]; then
+    err "Deploy failed before container mutation (${reason}) — preserving current version; no rollback."
+    LAST_TRANSACTION_VERDICT="DEPLOY_FAILED_BEFORE_MUTATION"
+    write_deploy_report "DEPLOY_FAILED_BEFORE_MUTATION" "$(cat <<EOF
+reason=${reason}
+note=Failure occurred before up -d; running container (if any) left untouched.
+EOF
+)"
+    return 1
+  fi
+
+  if [[ "${DEPLOY_COMMITTED:-0}" -eq 1 ]]; then
+    err "Deploy already committed — refusing auto-rollback (${reason})"
+    LAST_TRANSACTION_VERDICT="DEPLOY_FAILED_POST_COMMIT"
+    write_deploy_report "DEPLOY_FAILED_POST_COMMIT" "$(cat <<EOF
+reason=${reason}
+note=Automatic rollback refused after commit.
+EOF
+)"
+    return 1
+  fi
+
+  ROLLBACK_IN_PROGRESS=1
+  ROLLBACK_CALL_COUNT=$((ROLLBACK_CALL_COUNT + 1))
+  local target="${ROLLBACK_TARGET_SHA:-}"
+  err "Deploy failed (${reason}); attempting automatic rollback of demo only (attempt=${ROLLBACK_CALL_COUNT})..."
+
+  # Prevent ERR trap recursion while restoring
+  trap - ERR
+  set +e
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "DRY-RUN: would restore last known-good SHA: ${target:-none}"
+    LAST_TRANSACTION_VERDICT="DEPLOY_FAILED_ROLLED_BACK"
+    return 0
+  fi
+
+  if [[ -z "$target" ]]; then
+    stop_demo_only || true
+    LAST_TRANSACTION_VERDICT="DEPLOY_FAILED_NO_PREVIOUS_RELEASE"
+    write_deploy_report "DEPLOY_FAILED_NO_PREVIOUS_RELEASE" "$(cat <<EOF
+reason=${reason}
+note=No previous successful SHA; demo container stopped. Repo/logs preserved.
+EOF
+)"
+    return 1
+  fi
+
+  if [[ -n "${TRANSACTIONAL_ROLLBACK_HOOK:-}" ]]; then
+    "$TRANSACTIONAL_ROLLBACK_HOOK" "$reason" || true
+    return 1
+  fi
+
+  log_both "Auto-rollback target (last known good): ${target}"
+  collect_failure_diagnostics || true
+
+  # Each restore step isolated — die/exit inside becomes a failed subshell/command
+  if ! ( ensure_repo ); then
+    fail_restore_step "ensure_repo" "$reason"
+    return 1
+  fi
+
+  local full=""
+  if ! full="$(verify_remote_sha "$target")"; then
+    fail_restore_step "verify_remote_sha" "$reason"
+    return 1
+  fi
+
+  if ! ( checkout_sha "$full" ); then
+    fail_restore_step "checkout_sha" "$reason"
+    return 1
+  fi
+
+  local compose_path=""
+  if ! compose_path="$(compose_file_path)"; then
+    fail_restore_step "compose_file_path" "$reason"
+    return 1
+  fi
+  if ! ( validate_compose_file "$compose_path" ); then
+    fail_restore_step "validate_compose_file" "$reason"
+    return 1
+  fi
+
+  if ! build_demo; then
+    fail_restore_step "build_demo" "$reason"
+    return 1
+  fi
+
+  if ! up_demo; then
+    fail_restore_step "up_demo" "$reason"
+    return 1
+  fi
+
+  if ! wait_healthy; then
+    fail_restore_step "wait_healthy" "$reason"
+    return 1
+  fi
+
+  local smoke_script="${SCRIPTS_DIR}/smoke-vps.sh"
+  if [[ ! -x "$smoke_script" && -f "$smoke_script" ]]; then
+    chmod +x "$smoke_script" 2>/dev/null || true
+  fi
+  if ! "${smoke_script}"; then
+    collect_failure_diagnostics || true
+    stop_demo_only || true
+    LAST_TRANSACTION_VERDICT="DEPLOY_FAILED_ROLLBACK_SMOKE"
+    write_deploy_report "DEPLOY_FAILED_ROLLBACK_SMOKE" "$(cat <<EOF
+reason=${reason}
+note=Restored release was healthy but smoke failed; container stopped. CURRENT_SHA not updated.
+target=${full}
+EOF
+)"
+    return 1
+  fi
+
+  # Restored release passed gates — refresh CURRENT_SHA to known-good (candidate never committed)
+  if ! atomic_write_file "$CURRENT_SHA_FILE" "$full"; then
+    fail_restore_step "persist_restored_sha" "$reason"
+    return 1
+  fi
+
+  LAST_TRANSACTION_VERDICT="DEPLOY_FAILED_ROLLED_BACK"
+  write_deploy_report "DEPLOY_FAILED_ROLLED_BACK" "$(cat <<EOF
+reason=${reason}
+restored_sha=${full}
+rollback_attempts=${ROLLBACK_CALL_COUNT}
+note=Automatic rollback restored last known-good release. Failed SHA was not recorded as CURRENT.
+EOF
+)"
+  return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -698,13 +970,29 @@ atomic_write_file() {
   local content="$2"
   local dir tmp
   dir="$(dirname "$dest")"
-  mkdir -p "$dir"
-  tmp="$(mktemp "${dir}/.tmp.XXXXXX")"
-  printf '%s\n' "$content" >"$tmp"
-  mv -f "$tmp" "$dest"
+  if ! mkdir -p "$dir"; then
+    err "atomic_write_file: cannot create directory ${dir}"
+    return 1
+  fi
+  tmp="$(mktemp "${dir}/.tmp.XXXXXX")" || {
+    err "atomic_write_file: mktemp failed for ${dir}"
+    return 1
+  }
+  if ! printf '%s\n' "$content" >"$tmp"; then
+    rm -f "$tmp"
+    err "atomic_write_file: write failed for ${tmp}"
+    return 1
+  fi
+  if ! mv -f "$tmp" "$dest"; then
+    rm -f "$tmp"
+    err "atomic_write_file: rename failed → ${dest}"
+    return 1
+  fi
+  return 0
 }
 
 # Call ONLY after healthy + smokes + inventory comparison + all gates.
+# DEPLOY_COMMITTED must remain 0 until this returns success.
 write_sha_files() {
   local new_sha="$1"
   if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -714,21 +1002,43 @@ write_sha_files() {
   local prev
   prev="$(read_sha_file "$CURRENT_SHA_FILE" || true)"
   if [[ -n "$prev" && "$prev" != "$new_sha" ]]; then
-    atomic_write_file "$PREVIOUS_SHA_FILE" "$prev"
+    if ! atomic_write_file "$PREVIOUS_SHA_FILE" "$prev"; then
+      err "Failed to persist PREVIOUS_SHA"
+      return 1
+    fi
     log "PREVIOUS_SHA ← ${prev}"
   fi
-  atomic_write_file "$CURRENT_SHA_FILE" "$new_sha"
-  mkdir -p "${RELEASES_DIR}/${new_sha}"
+  if ! atomic_write_file "$CURRENT_SHA_FILE" "$new_sha"; then
+    err "Failed to persist CURRENT_SHA"
+    return 1
+  fi
+  if ! mkdir -p "${RELEASES_DIR}/${new_sha}"; then
+    err "Failed to create release directory for ${new_sha}"
+    return 1
+  fi
   local meta
-  meta="$(mktemp "${RELEASES_DIR}/${new_sha}/.meta.XXXXXX")"
-  cat >"$meta" <<EOF
+  meta="$(mktemp "${RELEASES_DIR}/${new_sha}/.meta.XXXXXX")" || {
+    err "Failed to allocate release metadata tempfile"
+    return 1
+  }
+  if ! cat >"$meta" <<EOF
 sha=${new_sha}
 deployed_utc=$(_ts)
 image=perola-demo-web:local
 container=${CONTAINER_NAME}
 EOF
-  mv -f "$meta" "${RELEASES_DIR}/${new_sha}/meta.txt"
+  then
+    rm -f "$meta"
+    err "Failed to write release metadata"
+    return 1
+  fi
+  if ! mv -f "$meta" "${RELEASES_DIR}/${new_sha}/meta.txt"; then
+    rm -f "$meta"
+    err "Failed to commit release metadata"
+    return 1
+  fi
   log "CURRENT_SHA ← ${new_sha} (committed after all gates)"
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -741,9 +1051,10 @@ snapshot_containers() {
     return 0
   fi
   if [[ "$DOCKER_OK" -ne 1 ]]; then
-    die "Docker required for container snapshot"
+    err "Docker required for container snapshot"
+    return 1
   fi
-  {
+  if ! {
     echo "# containers snapshot $(_ts)"
     docker ps -a --format 'table {{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}'
     echo
@@ -754,8 +1065,12 @@ snapshot_containers() {
       started="$(docker inspect -f '{{.State.StartedAt}}' "$id" 2>/dev/null || echo unknown)"
       echo "${name} ${id} ${started}"
     done
-  } >"$out"
+  } >"$out"; then
+    err "Failed to write container snapshot: ${out}"
+    return 1
+  fi
   log "Container snapshot: $out"
+  return 0
 }
 
 assert_preexisting_containers_unchanged() {
@@ -867,6 +1182,7 @@ wait_healthy() {
   return 1
 }
 
+# shellcheck disable=SC2120
 collect_failure_diagnostics() {
   local out="${1:-}"
   if [[ -z "$out" ]]; then
@@ -974,24 +1290,34 @@ write_deploy_report() {
   shift
   local body="$*"
   local report_file
+  LAST_TRANSACTION_VERDICT="$verdict"
+  # shellcheck disable=SC2034
+  : "${LAST_TRANSACTION_VERDICT}"
   if [[ "$DRY_RUN" -eq 1 ]]; then
     log "DRY-RUN verdict: ${verdict}"
     printf '%s\n' "$body"
     return 0
   fi
   report_file="${LOG_DIR}/deploy-${DEPLOY_TS}.log"
-  {
+  if [[ ! -d "$LOG_DIR" ]]; then
+    err "Cannot write deploy report: ${LOG_DIR} missing"
+    return 1
+  fi
+  if ! {
     echo "=== Pérola Demo Deploy Report ==="
     echo "verdict=${verdict}"
     echo "hostname=$(hostname)"
     echo "date_utc=$(_ts)"
     echo "$body"
-  } | tee "$report_file" | tee "$LAST_DEPLOY_REPORT" >/dev/null
-  # Also append to ACTIVE_LOG if distinct
-  if [[ -n "${ACTIVE_LOG:-}" && "$ACTIVE_LOG" != "$report_file" ]]; then
+  } | tee "$report_file" | tee "$LAST_DEPLOY_REPORT" >/dev/null; then
+    err "Failed to write deploy report"
+    return 1
+  fi
+  if [[ -n "${ACTIVE_LOG:-}" && "$ACTIVE_LOG" != "$report_file" && "$ACTIVE_LOG" != "/dev/null" ]]; then
     cat "$report_file" >>"$ACTIVE_LOG" || true
   fi
   log "Report: ${report_file}"
   log "LAST_DEPLOY_REPORT.txt updated"
   log "VERDICT: ${verdict}"
+  return 0
 }

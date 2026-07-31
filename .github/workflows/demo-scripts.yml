@@ -29,7 +29,8 @@ jobs:
             deploy/demo/smoke-vps.sh \
             deploy/demo/rollback-vps.sh \
             deploy/demo/status-vps.sh \
-            deploy/demo/tests/run-security-tests.sh
+            deploy/demo/tests/run-security-tests.sh \
+            deploy/demo/tests/run-transactional-tests.sh
           do
             bash -n "$f"
             echo "bash -n OK $f"
@@ -48,10 +49,14 @@ jobs:
             deploy/demo/smoke-vps.sh \
             deploy/demo/rollback-vps.sh \
             deploy/demo/status-vps.sh \
-            deploy/demo/tests/run-security-tests.sh
+            deploy/demo/tests/run-security-tests.sh \
+            deploy/demo/tests/run-transactional-tests.sh
 
       - name: Security unit tests
         run: bash deploy/demo/tests/run-security-tests.sh
+
+      - name: Transactional failure-injection tests
+        run: bash deploy/demo/tests/run-transactional-tests.sh
 
       - name: Dry-run deploy (no Docker daemon required)
         env:

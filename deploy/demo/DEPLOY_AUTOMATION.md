@@ -70,9 +70,14 @@ Todos usam `set -Eeuo pipefail`, `flock`, timestamps, códigos de saída e
 7. `build` (falha aqui **não** faz rollback — versão atual preservada).
 8. A partir de `up -d`: janela de mutação (`DEPLOY_MUTATION_STARTED=1`);
    health + smokes; falha → rollback automático (sem recursão).
+   O trap `ERR` é **transacional** (`handle_transactional_error`): falhas
+   inesperadas após `up -d` também disparam rollback; falhas antes de `up`
+   preservam o container; falhas durante rollback param só a demo; falhas
+   pós-`DEPLOY_COMMITTED` não fazem rollback automático.
 9. Inventário posterior + comparação de **todos** os containers preexistentes
    (exceto `perola-demo-web`).
-10. Só então grava `CURRENT_SHA` / `PREVIOUS_SHA` (escrita atômica) e relatório.
+10. Só então grava `CURRENT_SHA` / `PREVIOUS_SHA` (escrita atômica) e só depois
+    marca `DEPLOY_COMMITTED=1`. Falha na persistência do SHA dispara rollback.
 
 SHA é **obrigatório**. Não se implanta `HEAD` de `main` implicitamente.
 
@@ -190,13 +195,16 @@ Porta `3107` ocupada por processo que **não** seja `perola-demo-web` → aborta
 | `DEPLOY_SUCCESS_WITH_WARNINGS` | Sucesso com avisos (reservado) |
 | `DEPLOY_FAILED_ROLLED_BACK` | Falha; versão anterior restaurada e com smoke OK |
 | `DEPLOY_FAILED_ROLLBACK_SMOKE` | Rollback healthy mas smoke falhou; demo parada; SHA não commitado |
-| `DEPLOY_FAILED_ROLLBACK_FAILED` | Rollback falhou (health/recursão); demo parada |
-| `DEPLOY_FAILED_NO_PREVIOUS_RELEASE` | Falha sem release anterior (ou antes de `up -d`) |
+| `DEPLOY_FAILED_ROLLBACK_FAILED` | Rollback falhou (health/step/recursão); demo parada |
+| `DEPLOY_FAILED_BEFORE_MUTATION` | Falha antes de `up -d`; container atual preservado |
+| `DEPLOY_FAILED_POST_COMMIT` | Falha documental após commit; sem rollback automático |
+| `DEPLOY_FAILED_NO_PREVIOUS_RELEASE` | Falha sem release anterior |
 
-Testes de segurança locais:
+Testes de segurança e falha injetada:
 
 ```bash
 bash deploy/demo/tests/run-security-tests.sh
+bash deploy/demo/tests/run-transactional-tests.sh
 # ou: make demo-security-tests
 
 # ShellCheck via container (sem instalar na VPS):
@@ -207,7 +215,8 @@ docker run --rm -v "$PWD:/src" -w /src koalaman/shellcheck:stable \
   deploy/demo/smoke-vps.sh \
   deploy/demo/rollback-vps.sh \
   deploy/demo/status-vps.sh \
-  deploy/demo/tests/run-security-tests.sh
+  deploy/demo/tests/run-security-tests.sh \
+  deploy/demo/tests/run-transactional-tests.sh
 ```
 
 ---
